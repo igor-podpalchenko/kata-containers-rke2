@@ -10,7 +10,7 @@ use crate::utils::toml as toml_utils;
 use anyhow::{Context, Result};
 use log::info;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub async fn configure_containerd_runtime(
     config: &Config,
@@ -167,6 +167,9 @@ pub async fn configure_containerd(config: &Config, runtime: &str) -> Result<()> 
 
     let use_drop_in =
         super::manager::is_containerd_capable_of_using_drop_in_files(config, runtime).await?;
+    let rancher_runtime = is_rancher_based_runtime(runtime);
+    let config_targets = containerd_config_targets(config, runtime);
+    let mut drop_in_file_path: Option<PathBuf> = None;
 
     if !use_drop_in {
         if Path::new(&config.containerd_conf_file).exists()
@@ -181,6 +184,7 @@ pub async fn configure_containerd(config: &Config, runtime: &str) -> Result<()> 
         // Create the drop-in file directory and file
         let drop_in_file = format!("/host{}", config.containerd_drop_in_conf_file);
         log::info!("Creating drop-in file at: {}", drop_in_file);
+        drop_in_file_path = Some(PathBuf::from(&drop_in_file));
 
         if let Some(parent) = Path::new(&drop_in_file).parent() {
             log::info!("Creating parent directory: {:?}", parent);
@@ -208,12 +212,16 @@ pub async fn configure_containerd(config: &Config, runtime: &str) -> Result<()> 
         let imports_path = ".imports";
         let drop_in_path = format!("\"{}\"", config.containerd_drop_in_conf_file);
 
-        toml_utils::append_to_toml_array(
-            Path::new(&config.containerd_conf_file),
-            imports_path,
-            &drop_in_path,
-        )?;
-        log::info!("Successfully added drop-in to imports array");
+        for target in &config_targets {
+            ensure_config_target_exists(target, Path::new(&config.containerd_conf_file))?;
+
+            if rancher_runtime {
+                sanitize_rancher_import_globs(target)?;
+            }
+
+            toml_utils::append_to_toml_array(target, imports_path, &drop_in_path)?;
+            log::info!("Successfully added drop-in to imports array in {:?}", target);
+        }
     }
 
     log::info!("Configuring {} shim(s)", config.shims_for_arch.len());
@@ -223,6 +231,12 @@ pub async fn configure_containerd(config: &Config, runtime: &str) -> Result<()> 
         log::info!("Successfully configured runtime for shim: {}", shim);
     }
 
+    if rancher_runtime {
+        if let Some(drop_in_path) = drop_in_file_path {
+            sync_drop_in_template(&drop_in_path)?;
+        }
+    }
+
     log::info!("Successfully configured all containerd runtimes");
     Ok(())
 }
@@ -230,14 +244,25 @@ pub async fn configure_containerd(config: &Config, runtime: &str) -> Result<()> 
 pub async fn cleanup_containerd(config: &Config, runtime: &str) -> Result<()> {
     let use_drop_in =
         super::manager::is_containerd_capable_of_using_drop_in_files(config, runtime).await?;
+    let rancher_runtime = is_rancher_based_runtime(runtime);
 
     if use_drop_in {
         let drop_in_path = config.containerd_drop_in_conf_file.clone();
-        toml_utils::remove_from_toml_array(
-            Path::new(&config.containerd_conf_file),
-            ".imports",
-            &format!("\"{drop_in_path}\""),
-        )?;
+        for target in containerd_config_targets(config, runtime) {
+            if !target.exists() {
+                continue;
+            }
+
+            if rancher_runtime {
+                sanitize_rancher_import_globs(&target)?;
+            }
+
+            toml_utils::remove_from_toml_array(
+                &target,
+                ".imports",
+                &format!("\"{drop_in_path}\""),
+            )?;
+        }
         return Ok(());
     }
 
@@ -358,6 +383,90 @@ pub async fn containerd_erofs_snapshotter_version_check(config: &Config) -> Resu
     check_containerd_erofs_version_support(&container_runtime_version)
 }
 
+fn is_rancher_based_runtime(runtime: &str) -> bool {
+    matches!(runtime, "k3s" | "k3s-agent" | "rke2-agent" | "rke2-server")
+}
+
+fn containerd_config_targets(config: &Config, runtime: &str) -> Vec<PathBuf> {
+    let mut targets = vec![PathBuf::from(&config.containerd_conf_file)];
+
+    if is_rancher_based_runtime(runtime) {
+        targets.push(PathBuf::from(format!(
+            "{}.tmpl",
+            config.containerd_conf_file
+        )));
+    }
+
+    targets
+}
+
+fn ensure_config_target_exists(target: &Path, source: &Path) -> Result<()> {
+    if target.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    if source != target && source.exists() {
+        fs::copy(source, target)?;
+    } else {
+        fs::write(target, "")?;
+    }
+
+    Ok(())
+}
+
+fn sanitize_rancher_import_globs(config_file: &Path) -> Result<()> {
+    if !config_file.exists() {
+        return Ok(());
+    }
+
+    let imports = match toml_utils::get_toml_array(config_file, "imports") {
+        Ok(values) => values,
+        Err(_) => return Ok(()),
+    };
+
+    let mut sanitized_imports = Vec::with_capacity(imports.len());
+    let mut changed = false;
+
+    for entry in imports {
+        let sanitized_entry = if let Some(stripped) = entry.strip_suffix(".toml*") {
+            changed = true;
+            format!("{stripped}.toml")
+        } else {
+            entry
+        };
+
+        if !sanitized_imports.contains(&sanitized_entry) {
+            sanitized_imports.push(sanitized_entry);
+        } else if sanitized_entry != entry {
+            changed = true;
+        }
+    }
+
+    if changed {
+        toml_utils::set_toml_array(config_file, "imports", &sanitized_imports)?;
+    }
+
+    Ok(())
+}
+
+fn sync_drop_in_template(drop_in_path: &Path) -> Result<()> {
+    if !drop_in_path.exists() {
+        return Ok(());
+    }
+
+    let template_path = PathBuf::from(format!("{}.tmpl", drop_in_path.display()));
+    if let Some(parent) = template_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::copy(drop_in_path, &template_path)?;
+    Ok(())
+}
+
 pub fn snapshotter_handler_mapping_validation_check(config: &Config) -> Result<()> {
     info!(
         "Validating the snapshotter-handler mapping: \"{:?}\"",
@@ -421,6 +530,8 @@ pub fn snapshotter_handler_mapping_validation_check(config: &Config) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_check_containerd_snapshotter_version_support_1_6_with_mapping() {
@@ -518,5 +629,42 @@ mod tests {
                 expected_error
             );
         }
+    }
+
+    #[test]
+    fn test_sanitize_rancher_import_globs_strips_templates() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let config_path = temp_file.path();
+        let content = r#"
+version = 2
+
+imports = ["/var/lib/rancher/rke2/agent/etc/containerd/*.toml*", "/etc/containerd/conf.d/*.toml"]
+"#;
+        fs::write(config_path, content).unwrap();
+
+        sanitize_rancher_import_globs(config_path).unwrap();
+        let imports = toml_utils::get_toml_array(config_path, "imports").unwrap();
+
+        assert_eq!(
+            imports,
+            vec![
+                "/var/lib/rancher/rke2/agent/etc/containerd/*.toml".to_string(),
+                "/etc/containerd/conf.d/*.toml".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sync_drop_in_template_creates_tmpl_copy() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let drop_in_path = temp_file.path().to_path_buf();
+        fs::write(&drop_in_path, "runtime drop-in").unwrap();
+
+        sync_drop_in_template(&drop_in_path).unwrap();
+
+        let template_path = format!("{}.tmpl", drop_in_path.display());
+        assert!(Path::new(&template_path).exists());
+        let template_contents = fs::read_to_string(template_path).unwrap();
+        assert_eq!(template_contents, "runtime drop-in");
     }
 }

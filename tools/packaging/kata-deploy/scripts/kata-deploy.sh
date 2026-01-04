@@ -16,9 +16,6 @@ containerd_conf_file_backup="${containerd_conf_file}.bak"
 containerd_conf_tmpl_file=""
 use_containerd_drop_in_conf_file="false"
 
-# Backups are intentionally disabled (do not create .bak files).
-create_containerd_conf_backup="false"
-
 # If we fail for any reason a message will be displayed
 die() {
         msg="$*"
@@ -1074,8 +1071,7 @@ function configure_containerd() {
 	if [ $use_containerd_drop_in_conf_file = "false" ] && [ -f "$containerd_conf_file" ]; then
 		# only backup in case drop-in files are not supported, and when doing the backup
 		# only do it if a backup doesn't already exist (don't override original)
-		# NOTE: Backups are intentionally disabled (do not create .bak files).
-		:
+		cp -n "$containerd_conf_file" "$containerd_conf_file_backup"
 	fi
 
 	if [ $use_containerd_drop_in_conf_file = "true" ]; then
@@ -1085,11 +1081,6 @@ function configure_containerd() {
 		# Ensure current config imports the Kata drop-in, and ensure we don't import non-*.toml
 		# from the Kata containerd directory (avoids *.toml.tmpl being read).
 		local kata_containerd_prefix="${dest_dir}/containerd/"
-		# As requested, always write the drop-in import to the current config.toml too.
-		ensure_containerd_imports "/etc/containerd/config.toml" "${kata_containerd_prefix}" "${containerd_drop_in_conf_file}"
-
-		# Also update the active configuration file for this runtime (when it's a real TOML file).
-		# (For k3s/rke2, containerd_conf_file may point to a Go template; we skip those safely.)
 		ensure_containerd_imports "${containerd_conf_file}" "${kata_containerd_prefix}" "${containerd_drop_in_conf_file}"
 	fi
 
@@ -1157,7 +1148,6 @@ function cleanup_containerd() {
 		# There's no need to remove the drop-in file, as it'll be removed as
 		# part of the artefacts removal.  Thus, simply remove the file from
 		# the imports line of the containerd configuration and return.
-		remove_containerd_import "/etc/containerd/config.toml" "${containerd_drop_in_conf_file}"
 		remove_containerd_import "${containerd_conf_file}" "${containerd_drop_in_conf_file}"
 
 		# Remove the Go-template snippet we wrote on install.
@@ -1165,12 +1155,9 @@ function cleanup_containerd() {
 		return
 	fi
 
-	# Backups are disabled. Only revert if a backup already exists (e.g. from older runs).
+	rm -f $containerd_conf_file
 	if [ -f "$containerd_conf_file_backup" ]; then
-		rm -f $containerd_conf_file
 		mv "$containerd_conf_file_backup" "$containerd_conf_file"
-	else
-		warn "No backup found (${containerd_conf_file_backup}); leaving ${containerd_conf_file} as-is"
 	fi
 }
 

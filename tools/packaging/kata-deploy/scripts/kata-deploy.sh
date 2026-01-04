@@ -16,6 +16,9 @@ containerd_conf_file_backup="${containerd_conf_file}.bak"
 containerd_conf_tmpl_file=""
 use_containerd_drop_in_conf_file="false"
 
+# Backups are intentionally disabled (do not create .bak files).
+create_containerd_conf_backup="false"
+
 # If we fail for any reason a message will be displayed
 die() {
         msg="$*"
@@ -31,73 +34,6 @@ warn() {
 info() {
 	msg="$*"
 	echo "INFO: $msg" >&2
-}
-
-# Ensure containerd does not try to import directories that contain *.toml.tmpl.
-# We only want containerd to import the single drop-in TOML file:
-#   ${containerd_drop_in_conf_file}
-# and we also want kata.toml.tmpl to include:
-#   {{ template "base" . }}
-#   imports = ["${containerd_drop_in_conf_file}"]
-ensure_containerd_imports_are_file_only() {
-	local conf_file="${1}"
-	local import_file="${2}"
-
-	# Remove directory imports that would make containerd scan everything under /opt/kata/containerd/
-	# (including *.toml.tmpl).
-	#
-	# We keep other existing imports intact.
-	local dir1="${dest_dir}/containerd"
-	local dir2="${dest_dir}/containerd/"
-	local dir3="${dest_dir}/containerd/config.d"
-	local dir4="${dest_dir}/containerd/config.d/"
-
-	# Best effort: normalize/remove directory imports (do not fail the script if tomlq errors).
-	tomlq -i -t '.imports = ((.imports // []) | map(select(. != "'"${dir1}"'" and . != "'"${dir2}"'" and . != "'"${dir3}"'" and . != "'"${dir4}"'")))' "${conf_file}" 2>/dev/null || true
-
-	# Ensure the drop-in file import exists.
-	if ! grep -qF "${import_file}" "${conf_file}"; then
-		tomlq -i -t '.imports = ((.imports // []) + ["'"${import_file}"'"]) | unique' "${conf_file}" 2>/dev/null || true
-	fi
-}
-
-# Ensure kata.toml.tmpl includes the drop-in import and does NOT import a directory.
-# Keep any existing content in kata.toml.tmpl, only rewrite the base/import header.
-ensure_kata_toml_tmpl_has_dropin_import() {
-	local tmpl_file="${host_install_dir}/containerd/kata.toml.tmpl"
-	local import_file="${containerd_drop_in_conf_file}"
-	local base_line='{{ template "base" . }}'
-	local import_line='imports = ["'"${import_file}"'"]'
-
-	mkdir -p "$(dirname "${tmpl_file}")"
-
-	# If file doesn't exist, create minimal template with the required header.
-	if [ ! -f "${tmpl_file}" ]; then
-		cat > "${tmpl_file}" <<EOF
-${base_line}
-${import_line}
-EOF
-		return
-	fi
-
-	# Rewrite header to required 2 lines, drop any existing imports line(s) to avoid directory imports,
-	# and keep the rest of the template content unchanged.
-	local tmp
-	tmp="$(mktemp)"
-	{
-		printf '%s\n' "${base_line}"
-		printf '%s\n' "${import_line}"
-		awk '
-			# Drop an existing base template line (exact or whitespace-padded)
-			/^[[:space:]]*{{[[:space:]]*template[[:space:]]+"base"[[:space:]]+\.[[:space:]]*}}[[:space:]]*$/ { next }
-
-			# Drop any existing top-level imports assignment lines (directory imports are the problem).
-			/^[[:space:]]*imports[[:space:]]*=/ { next }
-
-			{ print }
-		' "${tmpl_file}"
-	} > "${tmp}"
-	mv "${tmp}" "${tmpl_file}"
 }
 
 # Get existing values from a TOML array field and return them as a comma-separated string
@@ -130,6 +66,73 @@ get_field_array_values() {
 	else
 		echo ""
 	fi
+}
+
+# Returns success if the file looks like a Go template (contains '{{ ... }}'),
+# which tomlq cannot safely parse.
+is_go_template_file() {
+	local f="$1"
+	[[ -f "$f" ]] || return 1
+	grep -q '{{' "$f"
+}
+
+# Ensure containerd 'imports' contains the Kata drop-in file and does not include
+# non-*.toml entries under the Kata containerd directory (avoids *.toml.tmpl, dirs, globs like '*').
+# This keeps any non-Kata imports intact.
+ensure_containerd_imports() {
+	local conf_file="$1"
+	local kata_containerd_prefix="$2" # e.g. /opt/kata/containerd/
+	local import_path="$3"            # e.g. /opt/kata/containerd/config.d/kata-deploy.toml
+
+	[[ -f "$conf_file" ]] || return 0
+
+	# Don't try to parse Go templates as TOML.
+	if is_go_template_file "$conf_file"; then
+		warn "Skipping TOML edit for Go template file: ${conf_file}"
+		return 0
+	fi
+
+	local expr
+	expr=$(printf '.imports = ((.imports // []) | map(select((startswith("%s")|not) or endswith(".toml"))) + ["%s"] | unique)' \
+		"${kata_containerd_prefix}" "${import_path}")
+
+	tomlq -i -t "${expr}" "${conf_file}" 2>/dev/null || true
+}
+
+# Remove a specific import from containerd config (safe for missing field).
+remove_containerd_import() {
+	local conf_file="$1"
+	local import_path="$2"
+
+	[[ -f "$conf_file" ]] || return 0
+
+	# Don't try to parse Go templates as TOML.
+	if is_go_template_file "$conf_file"; then
+		warn "Skipping TOML edit for Go template file: ${conf_file}"
+		return 0
+	fi
+
+	local expr
+	expr=$(printf '.imports |= ((. // []) | map(select(. != "%s")))' "${import_path}")
+
+	tomlq -i -t "${expr}" "${conf_file}" 2>/dev/null || true
+}
+
+# Write the requested Go template snippet to /etc/containerd/kata.toml.tmpl:
+# {{ template "base" . }}
+# imports = ["..."]
+#
+# import_path must be provided by caller.
+write_containerd_kata_template() {
+	local import_path="$1"
+
+	local tmpl_file="/etc/containerd/kata.toml.tmpl"
+
+	mkdir -p "$(dirname "$tmpl_file")"
+	cat >"${tmpl_file}" <<EOF
+{{ template "base" . }}
+imports = ["${import_path}"]
+EOF
 }
 
 DEBUG="${DEBUG:-"false"}"
@@ -1071,20 +1074,23 @@ function configure_containerd() {
 	if [ $use_containerd_drop_in_conf_file = "false" ] && [ -f "$containerd_conf_file" ]; then
 		# only backup in case drop-in files are not supported, and when doing the backup
 		# only do it if a backup doesn't already exist (don't override original)
-		cp -n "$containerd_conf_file" "$containerd_conf_file_backup"
+		# NOTE: Backups are intentionally disabled (do not create .bak files).
+		:
 	fi
 
 	if [ $use_containerd_drop_in_conf_file = "true" ]; then
-		# Write drop-in import to current config - config.toml (as it's implemented now)
-		# imports = ["/opt/kata/containerd/config.d/kata-deploy.toml"]
-		if [ -f "${containerd_conf_file}" ]; then
-			ensure_containerd_imports_are_file_only "${containerd_conf_file}" "${containerd_drop_in_conf_file}"
-		fi
+		# Write requested Go-template snippet (kata.toml.tmpl) to include the Kata drop-in.
+		write_containerd_kata_template "${containerd_drop_in_conf_file}"
 
-		# Write drop-in import to template - kata.toml.tmpl
-		# {{ template "base" . }}
-		# imports = ["/opt/kata/containerd/config.d/kata-deploy.toml"]  (path comes from var)
-		ensure_kata_toml_tmpl_has_dropin_import
+		# Ensure current config imports the Kata drop-in, and ensure we don't import non-*.toml
+		# from the Kata containerd directory (avoids *.toml.tmpl being read).
+		local kata_containerd_prefix="${dest_dir}/containerd/"
+		# As requested, always write the drop-in import to the current config.toml too.
+		ensure_containerd_imports "/etc/containerd/config.toml" "${kata_containerd_prefix}" "${containerd_drop_in_conf_file}"
+
+		# Also update the active configuration file for this runtime (when it's a real TOML file).
+		# (For k3s/rke2, containerd_conf_file may point to a Go template; we skip those safely.)
+		ensure_containerd_imports "${containerd_conf_file}" "${kata_containerd_prefix}" "${containerd_drop_in_conf_file}"
 	fi
 
 	for shim in "${shims[@]}"; do
@@ -1151,13 +1157,20 @@ function cleanup_containerd() {
 		# There's no need to remove the drop-in file, as it'll be removed as
 		# part of the artefacts removal.  Thus, simply remove the file from
 		# the imports line of the containerd configuration and return.
-		tomlq -i -t $(printf '.imports|=.-["%s"]' ${containerd_drop_in_conf_file}) ${containerd_conf_file}
+		remove_containerd_import "/etc/containerd/config.toml" "${containerd_drop_in_conf_file}"
+		remove_containerd_import "${containerd_conf_file}" "${containerd_drop_in_conf_file}"
+
+		# Remove the Go-template snippet we wrote on install.
+		rm -f "/etc/containerd/kata.toml.tmpl"
 		return
 	fi
 
-	rm -f $containerd_conf_file
+	# Backups are disabled. Only revert if a backup already exists (e.g. from older runs).
 	if [ -f "$containerd_conf_file_backup" ]; then
+		rm -f $containerd_conf_file
 		mv "$containerd_conf_file_backup" "$containerd_conf_file"
+	else
+		warn "No backup found (${containerd_conf_file_backup}); leaving ${containerd_conf_file} as-is"
 	fi
 }
 

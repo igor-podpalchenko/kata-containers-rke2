@@ -33,6 +33,105 @@ info() {
 	echo "INFO: $msg" >&2
 }
 
+# --- BEGIN: helpers added (safe import handling) ---
+
+# Ensure a file exists
+ensure_file() {
+	local f="$1"
+	mkdir -p "$(dirname "$f")"
+	touch "$f"
+}
+
+# Add an import entry into a TOML file using tomlq (only for real TOML, never templates).
+ensure_import_tomlq() {
+	local config_file="$1"
+	local import_path="$2"
+
+	[ -f "$config_file" ] || return 0
+
+	# Already present?
+	if grep -Fq "\"${import_path}\"" "$config_file" || grep -Fq "${import_path}" "$config_file"; then
+		return 0
+	fi
+
+	# Use tomlq to append import
+	tomlq -i -t "$(printf '.imports|=.+["%s"]' "${import_path}")" "${config_file}"
+}
+
+# Add an import entry into a template-ish file WITHOUT parsing.
+# This is pure text insertion, safe for Go-templated files.
+ensure_import_text() {
+	local file="$1"
+	local import_path="$2"
+
+	[ -f "$file" ] || return 0
+
+	# Already present?
+	if grep -Fq "\"${import_path}\"" "$file" || grep -Fq "${import_path}" "$file"; then
+		return 0
+	fi
+
+	# If there's an imports = [...] line already, try to append into it.
+	# Best effort for one-line arrays.
+	if grep -qE '^[[:space:]]*imports[[:space:]]*=' "$file"; then
+		# Try to append before trailing ]
+		# Works for: imports = ["a","b"] (same line)
+		sed -i -E "s|^[[:space:]]*imports[[:space:]]*=[[:space:]]*\\[(.*)\\][[:space:]]*$|imports = [\\1, \"${import_path}\"]|g" "$file" || true
+
+		# If still not present, insert a fresh imports line near top
+		if ! (grep -Fq "\"${import_path}\"" "$file" || grep -Fq "${import_path}" "$file"); then
+			sed -i "1a\\imports = [\"${import_path}\"]" "$file" || true
+		fi
+	else
+		# Insert at top
+		sed -i "1a\\imports = [\"${import_path}\"]" "$file" || true
+	fi
+}
+
+# Remove an import entry from a TOML file using tomlq (only for real TOML).
+remove_import_tomlq() {
+	local config_file="$1"
+	local import_path="$2"
+
+	[ -f "$config_file" ] || return 0
+
+	# If not present, nothing to do
+	if ! grep -Fq "\"${import_path}\"" "$config_file" && ! grep -Fq "${import_path}" "$config_file"; then
+		return 0
+	fi
+
+	tomlq -i -t "$(printf '.imports|=.-["%s"]' "${import_path}")" "${config_file}" || true
+}
+
+# Remove an import entry from a template-ish file WITHOUT parsing.
+# Best-effort text removal for one-line imports arrays.
+remove_import_text() {
+	local file="$1"
+	local import_path="$2"
+
+	[ -f "$file" ] || return 0
+
+	if ! grep -Fq "\"${import_path}\"" "$file" && ! grep -Fq "${import_path}" "$file"; then
+		return 0
+	fi
+
+	# Remove occurrences like: , "path"  OR  "path",  OR  "path"
+	sed -i -E \
+		-e "s|,[[:space:]]*\"${import_path}\"||g" \
+		-e "s|\"${import_path}\"[[:space:]]*,||g" \
+		-e "s|\"${import_path}\"||g" \
+		"$file" || true
+
+	# Tidy accidental double commas / spacing inside brackets (best effort)
+	sed -i -E \
+		-e 's|\[[[:space:]]*,|\[|g' \
+		-e 's|,[[:space:]]*,|,|g' \
+		-e 's|,[[:space:]]*\]|]|g' \
+		"$file" || true
+}
+
+# --- END: helpers added ---
+
 # Get existing values from a TOML array field and return them as a comma-separated string
 # * get_field_array_values "${config}" "enable_annotations" "${shim}"
 get_field_array_values() {
@@ -179,6 +278,7 @@ if [ -n "${MULTI_INSTALL_SUFFIX}" ]; then
 	crio_drop_in_conf_file="${crio_drop_in_conf_file}-${MULTI_INSTALL_SUFFIX}"
 fi
 containerd_drop_in_conf_file="${dest_dir}/containerd/config.d/kata-deploy.toml"
+containerd_drop_in_conf_file_tmpl="${containerd_drop_in_conf_file}.tmpl"
 
 # Here, again, there's no `/` between /host and ${dest_dir}, otherwise we'd have it
 # doubled here as well, as: `/host//opt/kata`
@@ -1008,9 +1108,33 @@ function configure_containerd() {
 	fi
 
 	if [ $use_containerd_drop_in_conf_file = "true" ]; then
-		if ! grep -q "${containerd_drop_in_conf_file}" ${containerd_conf_file}; then
-			tomlq -i -t $(printf '.imports|=.+["%s"]' ${containerd_drop_in_conf_file}) ${containerd_conf_file}
+		# Ensure the host drop-in file exists (main already does this for install; keep it safe)
+		ensure_file "/host${containerd_drop_in_conf_file}"
+
+		# REQUIRED: import drop-in is added to config.toml AND kata-deploy.toml.tmpl
+		#
+		# 1) Add import to the current root config file in use:
+		#    - If it's a real TOML, use tomlq
+		#    - If it's a .tmpl (Go template), do text-only insertion
+		if [[ "${containerd_conf_file}" == *.tmpl ]]; then
+			ensure_import_text "${containerd_conf_file}" "${containerd_drop_in_conf_file}"
+		else
+			if ! grep -q "${containerd_drop_in_conf_file}" "${containerd_conf_file}" 2>/dev/null; then
+				ensure_import_tomlq "${containerd_conf_file}" "${containerd_drop_in_conf_file}"
+			fi
 		fi
+
+		# 2) Also add import to /etc/containerd/config.toml (only if it exists and is different),
+		#    per your requirement. We avoid creating a new empty config.toml on systems that don't use it.
+		if [[ "${containerd_conf_file}" != "/etc/containerd/config.toml" ]] && [[ -f "/etc/containerd/config.toml" ]]; then
+			if ! grep -q "${containerd_drop_in_conf_file}" "/etc/containerd/config.toml" 2>/dev/null; then
+				ensure_import_tomlq "/etc/containerd/config.toml" "${containerd_drop_in_conf_file}"
+			fi
+		fi
+
+		# 3) Ensure kata-deploy.toml.tmpl exists and has the same import (text-only; safe for templates)
+		ensure_file "/host${containerd_drop_in_conf_file_tmpl}"
+		ensure_import_text "/host${containerd_drop_in_conf_file_tmpl}" "${containerd_drop_in_conf_file}"
 	fi
 
 	for shim in "${shims[@]}"; do
@@ -1074,10 +1198,20 @@ function cleanup_crio() {
 
 function cleanup_containerd() {
 	if [ $use_containerd_drop_in_conf_file = "true" ]; then
-		# There's no need to remove the drop-in file, as it'll be removed as
-		# part of the artefacts removal.  Thus, simply remove the file from
-		# the imports line of the containerd configuration and return.
-		tomlq -i -t $(printf '.imports|=.-["%s"]' ${containerd_drop_in_conf_file}) ${containerd_conf_file}
+		# Remove drop-in import from the root config in use.
+		# - For real TOML, use tomlq
+		# - For template files, use text-only removal
+		if [[ "${containerd_conf_file}" == *.tmpl ]]; then
+			remove_import_text "${containerd_conf_file}" "${containerd_drop_in_conf_file}"
+		else
+			remove_import_tomlq "${containerd_conf_file}" "${containerd_drop_in_conf_file}"
+		fi
+
+		# Also remove from /etc/containerd/config.toml if it exists and is different
+		if [[ "${containerd_conf_file}" != "/etc/containerd/config.toml" ]] && [[ -f "/etc/containerd/config.toml" ]]; then
+			remove_import_tomlq "/etc/containerd/config.toml" "${containerd_drop_in_conf_file}"
+		fi
+
 		return
 	fi
 

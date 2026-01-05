@@ -1,0 +1,2 @@
+FROM ghcr.io/kata-containers/kata-deploy@sha256:860a70e2339c79197c0d9860bf663242a34167a4173a9ba74e8ab13484211f4e
+COPY --chmod=0755 kata-deploy-dev.sh /opt/kata-artifacts/scripts/kata-deploy.sh
